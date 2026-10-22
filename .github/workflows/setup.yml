@@ -171,7 +171,7 @@ jobs:
             || { printf 'Caddyfile is missing\n' >&2; exit 1; }
 
           compose config --quiet
-          compose run --rm --no-deps caddy validate \
+          compose run --rm --no-deps caddy caddy validate \
             --config /etc/caddy/Caddyfile \
             --adapter caddyfile
 
@@ -184,6 +184,7 @@ jobs:
           REMOTE_SCRIPT
 
       - name: Start Redis
+        if: success()
         env:
           SSH_TARGET: ${{ vars.SSH_TARGET }}
           REMOTE_INFRA_DIR: ${{ vars.REMOTE_INFRA_DIR }}
