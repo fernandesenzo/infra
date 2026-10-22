@@ -2,7 +2,7 @@ s.enzofer.fyi {
     reverse_proxy shortener:8080
 }
 
-napkin.enzofer.fyi{
+napkin.enzofer.fyi {
     reverse_proxy napkin:8080
 }
 
