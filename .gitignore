@@ -1,0 +1,14 @@
+.env
+.env.*
+!config/.env.example
+config/*.env
+*.pem
+*.key
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+*.log
+*.tmp
+tmp/

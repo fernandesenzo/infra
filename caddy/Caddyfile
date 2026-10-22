@@ -1,0 +1,13 @@
+s.enzofer.fyi {
+    reverse_proxy shortener:8080
+}
+
+napkin.enzofer.fyi{
+    reverse_proxy napkin:8080
+}
+
+enzofer.fyi {
+    root * /website/current
+    try_files {path} /index.html
+    file_server
+}

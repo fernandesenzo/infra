@@ -1,0 +1,231 @@
+name: setup
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/setup.yml'
+      - 'compose/**'
+      - 'caddy/Caddyfile'
+      - 'deploy/redis-env.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    environment: production
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out infra repository
+        uses: actions/checkout@v4
+
+      - name: Validate settings and configure SSH
+        env:
+          SSH_TARGET: ${{ vars.SSH_TARGET }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ vars.SSH_KNOWN_HOSTS }}
+          REMOTE_INFRA_DIR: ${{ vars.REMOTE_INFRA_DIR }}
+          REDIS_ADDR: ${{ vars.REDIS_ADDR }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+
+          : "${SSH_TARGET:?SSH_TARGET is required}"
+          : "${SSH_PRIVATE_KEY:?SSH_PRIVATE_KEY is required}"
+          : "${SSH_KNOWN_HOSTS:?SSH_KNOWN_HOSTS is required}"
+          : "${REMOTE_INFRA_DIR:?REMOTE_INFRA_DIR is required}"
+          : "${REDIS_ADDR:?REDIS_ADDR is required}"
+          : "${REDIS_PASSWORD:?REDIS_PASSWORD is required}"
+
+          [[ "$SSH_TARGET" =~ ^[A-Za-z0-9._@-]+$ ]] \
+            || { printf 'SSH_TARGET contains unsupported characters\n' >&2; exit 1; }
+          [[ "$REMOTE_INFRA_DIR" =~ ^/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] \
+            || { printf 'REMOTE_INFRA_DIR must be a specific absolute path\n' >&2; exit 1; }
+          [[ ! "$REMOTE_INFRA_DIR" =~ (^|/)\.\.?(/|$) ]] \
+            || { printf 'REMOTE_INFRA_DIR cannot contain . or .. path components\n' >&2; exit 1; }
+          [[ "$REDIS_ADDR" =~ ^[A-Za-z0-9._-]+:[0-9]{1,5}$ ]] \
+            || { printf 'REDIS_ADDR must use the host:port format, such as redis:6379\n' >&2; exit 1; }
+          [[ "$REDIS_PASSWORD" != *$'\n'* && "$REDIS_PASSWORD" != *$'\r'* ]] \
+            || { printf 'REDIS_PASSWORD must be a single-line value\n' >&2; exit 1; }
+
+          redis_port=${REDIS_ADDR##*:}
+          (( 10#$redis_port > 0 && 10#$redis_port <= 65535 )) \
+            || { printf 'REDIS_ADDR port must be between 1 and 65535\n' >&2; exit 1; }
+
+          umask 077
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$RUNNER_TEMP/infra-deploy-key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/infra-known-hosts"
+          chmod 600 "$RUNNER_TEMP/infra-deploy-key" "$RUNNER_TEMP/infra-known-hosts"
+
+      - name: Prepare VPS directories and upload Compose and Caddy files
+        env:
+          SSH_TARGET: ${{ vars.SSH_TARGET }}
+          REMOTE_INFRA_DIR: ${{ vars.REMOTE_INFRA_DIR }}
+        run: |
+          set -Eeuo pipefail
+
+          ssh_options=(
+            -i "$RUNNER_TEMP/infra-deploy-key"
+            -o IdentitiesOnly=yes
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+            -o "UserKnownHostsFile=$RUNNER_TEMP/infra-known-hosts"
+          )
+
+          remote_parent=${REMOTE_INFRA_DIR%/*}
+          [[ -n "$remote_parent" ]] || remote_parent=/
+          if [[ "$remote_parent" == / ]]; then
+            remote_website_dir=/website
+          else
+            remote_website_dir="$remote_parent/website"
+          fi
+
+          ssh "${ssh_options[@]}" "$SSH_TARGET" \
+            "REMOTE_INFRA_DIR='$REMOTE_INFRA_DIR' REMOTE_WEBSITE_DIR='$remote_website_dir' bash -s" <<'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+
+          mkdir -p -- "$REMOTE_INFRA_DIR/compose" "$REMOTE_INFRA_DIR/caddy"
+
+          [[ -d "$REMOTE_WEBSITE_DIR" ]] \
+            || { printf 'Website bind-mount directory does not exist: %s\n' "$REMOTE_WEBSITE_DIR" >&2; exit 1; }
+          [[ -w "$REMOTE_WEBSITE_DIR" ]] \
+            || { printf 'Website bind-mount directory is not writable by the deploy user: %s\n' "$REMOTE_WEBSITE_DIR" >&2; exit 1; }
+          REMOTE_SCRIPT
+
+          tar -czf - compose caddy |
+            ssh "${ssh_options[@]}" "$SSH_TARGET" \
+              "tar -xzf - -C '$REMOTE_INFRA_DIR'"
+
+      - name: Create or update Redis environment files
+        env:
+          SSH_TARGET: ${{ vars.SSH_TARGET }}
+          REMOTE_INFRA_DIR: ${{ vars.REMOTE_INFRA_DIR }}
+          REDIS_ADDR: ${{ vars.REDIS_ADDR }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+
+          ssh_options=(
+            -i "$RUNNER_TEMP/infra-deploy-key"
+            -o IdentitiesOnly=yes
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+            -o "UserKnownHostsFile=$RUNNER_TEMP/infra-known-hosts"
+          )
+          remote_script=''
+
+          cleanup() {
+            if [[ -n "$remote_script" ]]; then
+              ssh "${ssh_options[@]}" "$SSH_TARGET" "rm -f -- '$remote_script'" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT
+
+          remote_script=$(ssh "${ssh_options[@]}" "$SSH_TARGET" 'mktemp --tmpdir=/tmp infra-redis-env.XXXXXXXX')
+          [[ "$remote_script" =~ ^/tmp/infra-redis-env\.[A-Za-z0-9]{8}$ ]] \
+            || { printf 'Could not create a safe temporary script path on the VPS\n' >&2; exit 1; }
+
+          scp -q "${ssh_options[@]}" deploy/redis-env.sh "$SSH_TARGET:$remote_script"
+          ssh "${ssh_options[@]}" "$SSH_TARGET" "chmod 600 -- '$remote_script'"
+
+          printf '%s\n%s\n' "$REDIS_ADDR" "$REDIS_PASSWORD" |
+            ssh "${ssh_options[@]}" "$SSH_TARGET" \
+              "bash '$remote_script' '$REMOTE_INFRA_DIR'"
+
+      - name: Start Caddy
+        env:
+          SSH_TARGET: ${{ vars.SSH_TARGET }}
+          REMOTE_INFRA_DIR: ${{ vars.REMOTE_INFRA_DIR }}
+        run: |
+          set -Eeuo pipefail
+
+          ssh_options=(
+            -i "$RUNNER_TEMP/infra-deploy-key"
+            -o IdentitiesOnly=yes
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+            -o "UserKnownHostsFile=$RUNNER_TEMP/infra-known-hosts"
+          )
+
+          ssh "${ssh_options[@]}" "$SSH_TARGET" \
+            "REMOTE_INFRA_DIR='$REMOTE_INFRA_DIR' bash -s" <<'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+
+          compose() {
+            docker compose \
+              --project-name infra \
+              --project-directory "$REMOTE_INFRA_DIR/compose" \
+              --file "$REMOTE_INFRA_DIR/compose/caddy.yml" \
+              "$@"
+          }
+
+          [[ -f "$REMOTE_INFRA_DIR/compose/caddy.yml" ]] \
+            || { printf 'Caddy Compose file is missing\n' >&2; exit 1; }
+          [[ -f "$REMOTE_INFRA_DIR/caddy/Caddyfile" ]] \
+            || { printf 'Caddyfile is missing\n' >&2; exit 1; }
+
+          compose config --quiet
+          compose run --rm --no-deps caddy validate \
+            --config /etc/caddy/Caddyfile \
+            --adapter caddyfile
+
+          if ! compose up --detach --wait --wait-timeout 60 caddy; then
+            compose logs --no-color --tail 100 caddy >&2 || true
+            exit 1
+          fi
+
+          compose ps caddy
+          REMOTE_SCRIPT
+
+      - name: Start Redis
+        env:
+          SSH_TARGET: ${{ vars.SSH_TARGET }}
+          REMOTE_INFRA_DIR: ${{ vars.REMOTE_INFRA_DIR }}
+        run: |
+          set -Eeuo pipefail
+
+          ssh_options=(
+            -i "$RUNNER_TEMP/infra-deploy-key"
+            -o IdentitiesOnly=yes
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+            -o "UserKnownHostsFile=$RUNNER_TEMP/infra-known-hosts"
+          )
+
+          ssh "${ssh_options[@]}" "$SSH_TARGET" \
+            "REMOTE_INFRA_DIR='$REMOTE_INFRA_DIR' bash -s" <<'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+
+          compose() {
+            docker compose \
+              --project-name infra \
+              --project-directory "$REMOTE_INFRA_DIR/compose" \
+              --file "$REMOTE_INFRA_DIR/compose/redis.yml" \
+              --env-file "$REMOTE_INFRA_DIR/config/compose.env" \
+              "$@"
+          }
+
+          [[ -f "$REMOTE_INFRA_DIR/compose/redis.yml" ]] \
+            || { printf 'Redis Compose file is missing\n' >&2; exit 1; }
+          [[ -f "$REMOTE_INFRA_DIR/config/compose.env" ]] \
+            || { printf 'Compose environment file is missing\n' >&2; exit 1; }
+
+          compose config --quiet
+
+          if ! compose up --detach --wait --wait-timeout 60 redis; then
+            compose logs --no-color --tail 100 redis >&2 || true
+            exit 1
+          fi
+
+          compose ps redis
+          REMOTE_SCRIPT
+
+      - name: Remove temporary SSH credentials
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/infra-deploy-key" "$RUNNER_TEMP/infra-known-hosts"

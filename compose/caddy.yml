@@ -1,0 +1,28 @@
+services:
+  caddy:
+    image: caddy:2.11.7
+    ports:
+      - "0.0.0.0:80:80"
+      - "0.0.0.0:443:443"
+    volumes:
+      - ../caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../../website/:/website/:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+    networks:
+      - infra_reverse_proxy
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "3"
+    mem_limit: 100mb
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  infra_reverse_proxy:
+    name: infra_reverse_proxy

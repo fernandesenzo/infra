@@ -1,0 +1,30 @@
+services:
+  shortener:
+    image: "${SHORTENER_IMAGE:?SHORTENER_IMAGE needs to be set}"
+    env_file:
+      - path: ../config/shortener.env
+        format: raw
+    networks:
+      - infra_shortener
+      - infra_reverse_proxy
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "3"
+    mem_limit: 200mb
+
+networks:
+  infra_shortener:
+    external: true
+    name: infra_shortener
+  infra_reverse_proxy:
+    external: true
+    name: infra_reverse_proxy
